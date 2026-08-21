@@ -64,19 +64,45 @@ def list_recent_videos(channel_url, max_videos=15):
 
 
 def fetch_video_detail(video_url):
-    """영상 상세 메타데이터 + 자막(가능하면)을 가져온다."""
+    """영상 상세 메타데이터 + 자막(가능하면)을 가져온다.
+
+    기본 web 플레이어로는 클라우드 환경에서 "Sign in to confirm you're not
+    a bot" (HTTP 429)로 거의 항상 차단된다. mweb 클라이언트 +
+    --ignore-no-formats-error 조합을 쓰면 (다운로드용 포맷은 없지만) 제목/
+    설명/업로드일 등 메타데이터는 대체로 가져올 수 있다. 다만 자막은 mweb도
+    PO 토큰이 없으면 대부분 제공되지 않는다 (아래에서 별도로 재시도).
+    """
     videos = run_yt_dlp_json(
         [
             "--skip-download",
             "--dump-json",
-            "--write-auto-sub",
-            "--sub-lang", "ko",
-            "--sub-format", "vtt",
-            "--no-write-sub",
+            "--extractor-args", "youtube:player_client=mweb",
+            "--ignore-no-formats-error",
             video_url,
         ]
     )
-    return videos[0] if videos else None
+    detail = videos[0] if videos else None
+    if detail is None:
+        return None
+
+    if not detail.get("automatic_captions") and not detail.get("subtitles"):
+        sub_videos = run_yt_dlp_json(
+            [
+                "--skip-download",
+                "--dump-json",
+                "--write-auto-sub",
+                "--sub-lang", "ko",
+                "--sub-format", "vtt",
+                "--no-write-sub",
+                "--extractor-args", "youtube:player_client=mweb",
+                "--ignore-no-formats-error",
+                video_url,
+            ]
+        )
+        if sub_videos and sub_videos[0].get("requested_subtitles"):
+            detail["requested_subtitles"] = sub_videos[0]["requested_subtitles"]
+
+    return detail
 
 
 def collect(since_days=1, max_videos_per_channel=15):
