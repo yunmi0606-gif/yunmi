@@ -6,15 +6,21 @@ data/YYYY-MM-DD.json 으로 저장한다. (yt-dlp 필요: pip install yt-dlp)
     python collect.py [--since-days 1]
 
 주의:
-    실행 환경(특히 클라우드/서버 IP)에 따라 유튜브의 봇 차단(HTTP 429,
-    "Sign in to confirm you're not a bot")으로 개별 영상 상세 정보/자막
-    수집이 실패할 수 있다. 이 경우 --cookies-from-browser 로 로그인된
-    브라우저 쿠키를 넘기거나, 로컬(개인 PC) 환경에서 실행해야 한다.
+    클라우드 환경(특히 서버 IP)에서는 유튜브가 기본(web_safari/mweb 등) 클라이언트에
+    HTTP 429 / "Sign in to confirm you're not a bot"으로 응답해 영상 상세 정보를
+    가져오지 못하는 경우가 많다. 이를 우회하기 위해 `--extractor-args
+    youtube:player_client=android`를 사용한다. android 클라이언트는 자동 생성
+    자막(automatic_captions)의 서명된 timedtext URL을 정상적으로 돌려주므로,
+    해당 URL을 직접 요청해 자막 전문(vtt)을 받아 텍스트로 정리한다.
+    그래도 막힐 경우를 대비해 web(+--ignore-no-formats-error) 클라이언트로 재시도한다.
 """
 import argparse
+import html
 import json
+import re
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +29,8 @@ CHANNEL_FILE = BASE_DIR / "channel.txt"
 DATA_DIR = BASE_DIR / "data"
 
 KST = timezone(timedelta(hours=9))
+
+PLAYER_CLIENTS = ["android", "web"]
 
 
 def read_channels():
@@ -35,15 +43,12 @@ def read_channels():
     return channels
 
 
-def run_yt_dlp_json(args):
+def run_yt_dlp_json(args, extra_args=()):
     proc = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", *args],
+        [sys.executable, "-m", "yt_dlp", *extra_args, *args],
         capture_output=True,
         text=True,
     )
-    if proc.returncode != 0:
-        print(f"  [warn] yt-dlp 실패: {' '.join(args)}\n{proc.stderr.strip()[-500:]}", file=sys.stderr)
-        return []
     videos = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -53,6 +58,8 @@ def run_yt_dlp_json(args):
             videos.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+    if proc.returncode != 0 and not videos:
+        print(f"  [warn] yt-dlp 실패: {' '.join(args)}\n{proc.stderr.strip()[-500:]}", file=sys.stderr)
     return videos
 
 
@@ -64,19 +71,56 @@ def list_recent_videos(channel_url, max_videos=15):
 
 
 def fetch_video_detail(video_url):
-    """영상 상세 메타데이터 + 자막(가능하면)을 가져온다."""
-    videos = run_yt_dlp_json(
-        [
-            "--skip-download",
-            "--dump-json",
-            "--write-auto-sub",
-            "--sub-lang", "ko",
-            "--sub-format", "vtt",
-            "--no-write-sub",
-            video_url,
-        ]
-    )
-    return videos[0] if videos else None
+    """영상 상세 메타데이터를 여러 player_client로 순차 시도해 가져온다."""
+    for client in PLAYER_CLIENTS:
+        videos = run_yt_dlp_json(
+            ["--skip-download", "--dump-json", "--ignore-no-formats-error", video_url],
+            extra_args=["--extractor-args", f"youtube:player_client={client}"],
+        )
+        if videos:
+            return videos[0]
+    return None
+
+
+def vtt_to_text(vtt_text):
+    """자동 생성 vtt 자막을 사람이 읽을 수 있는 텍스트로 정리한다.
+
+    유튜브 자동자막은 롤링(스크롤) 방식이라 인접 큐 사이에 줄이 중복된다.
+    직전에 추가한 줄과 동일한 줄은 건너뛰어 중복을 제거한다.
+    """
+    lines = []
+    last_line = None
+    for raw_line in vtt_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
+            continue
+        if "-->" in line:
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        line = html.unescape(line).strip()
+        if not line or line == last_line:
+            continue
+        lines.append(line)
+        last_line = line
+    return " ".join(lines)
+
+
+def fetch_transcript(detail):
+    captions = detail.get("automatic_captions") or {}
+    for lang in ("ko", "ko-orig"):
+        entries = captions.get(lang) or []
+        vtt_url = next((e.get("url") for e in entries if e.get("ext") == "vtt"), None)
+        if not vtt_url:
+            continue
+        try:
+            with urllib.request.urlopen(vtt_url, timeout=20) as resp:
+                vtt_text = resp.read().decode("utf-8", errors="ignore")
+            text = vtt_to_text(vtt_text)
+            if text:
+                return text
+        except Exception as exc:
+            print(f"  [warn] 자막 다운로드 실패: {exc}", file=sys.stderr)
+    return None
 
 
 def collect(since_days=1, max_videos_per_channel=15):
@@ -100,6 +144,10 @@ def collect(since_days=1, max_videos_per_channel=15):
                 if uploaded_at < cutoff:
                     continue
 
+            transcript = fetch_transcript(detail)
+            status = "ok" if transcript else "no_transcript"
+            print(f"  [{status}] {detail.get('title')}")
+
             results.append(
                 {
                     "channel": channel_url,
@@ -110,13 +158,15 @@ def collect(since_days=1, max_videos_per_channel=15):
                     "uploader": detail.get("uploader"),
                     "description": detail.get("description"),
                     "duration": detail.get("duration"),
+                    "transcript": transcript,
                 }
             )
 
     DATA_DIR.mkdir(exist_ok=True)
     out_path = DATA_DIR / f"{datetime.now(KST).strftime('%Y-%m-%d')}.json"
     out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n총 {len(results)}개 영상 수집 완료 -> {out_path}")
+    ok_count = sum(1 for r in results if r["transcript"])
+    print(f"\n총 {len(results)}개 영상 수집 완료 (자막 확보 {ok_count}건) -> {out_path}")
     return results
 
 
