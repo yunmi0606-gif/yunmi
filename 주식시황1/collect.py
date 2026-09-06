@@ -13,8 +13,10 @@ data/YYYY-MM-DD.json 으로 저장한다. (yt-dlp 필요: pip install yt-dlp)
 """
 import argparse
 import json
+import re
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +25,11 @@ CHANNEL_FILE = BASE_DIR / "channel.txt"
 DATA_DIR = BASE_DIR / "data"
 
 KST = timezone(timedelta(hours=9))
+
+# 클라우드/서버 IP에서는 기본(web) player_client가 유튜브 봇 차단(HTTP 429,
+# "Sign in to confirm you're not a bot")에 걸리는 경우가 많다. android ->
+# web 순서로 재시도하면 대부분 우회된다.
+PLAYER_CLIENTS = ["android", "web"]
 
 
 def read_channels():
@@ -63,20 +70,57 @@ def list_recent_videos(channel_url, max_videos=15):
     )
 
 
+def _vtt_to_text(vtt_text):
+    lines = []
+    for line in vtt_text.splitlines():
+        line = line.strip()
+        if not line or line == "WEBVTT":
+            continue
+        if line.startswith(("Kind:", "Language:")):
+            continue
+        if "-->" in line:
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        if line and (not lines or lines[-1] != line):
+            lines.append(line)
+    return " ".join(lines)
+
+
+def fetch_transcript(automatic_captions):
+    """automatic_captions dict에서 한국어 자막 URL을 찾아 텍스트로 변환."""
+    for lang in ("ko", "ko-orig"):
+        tracks = automatic_captions.get(lang) if automatic_captions else None
+        if not tracks:
+            continue
+        vtt_track = next((t for t in tracks if t.get("ext") == "vtt"), tracks[0])
+        try:
+            with urllib.request.urlopen(vtt_track["url"], timeout=20) as resp:
+                return _vtt_to_text(resp.read().decode("utf-8", errors="ignore"))
+        except Exception as exc:
+            print(f"  [warn] 자막 다운로드 실패: {exc}", file=sys.stderr)
+    return None
+
+
 def fetch_video_detail(video_url):
     """영상 상세 메타데이터 + 자막(가능하면)을 가져온다."""
-    videos = run_yt_dlp_json(
-        [
-            "--skip-download",
-            "--dump-json",
-            "--write-auto-sub",
-            "--sub-lang", "ko",
-            "--sub-format", "vtt",
-            "--no-write-sub",
-            video_url,
-        ]
-    )
-    return videos[0] if videos else None
+    detail = None
+    for client in PLAYER_CLIENTS:
+        videos = run_yt_dlp_json(
+            [
+                "--extractor-args", f"youtube:player_client={client}",
+                "--skip-download",
+                "--dump-json",
+                video_url,
+            ]
+        )
+        if videos:
+            detail = videos[0]
+            break
+    if not detail:
+        return None
+
+    detail["transcript"] = fetch_transcript(detail.get("automatic_captions"))
+    return detail
 
 
 def collect(since_days=1, max_videos_per_channel=15):
@@ -110,6 +154,7 @@ def collect(since_days=1, max_videos_per_channel=15):
                     "uploader": detail.get("uploader"),
                     "description": detail.get("description"),
                     "duration": detail.get("duration"),
+                    "transcript": detail.get("transcript"),
                 }
             )
 
