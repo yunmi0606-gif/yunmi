@@ -19,6 +19,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -42,14 +43,25 @@ def read_channels():
     return channels
 
 
+BOT_CHECK_RETRY_DELAYS = (5, 15)  # 초 단위, "Sign in to confirm you're not a bot" 대응
+
+
 def run_yt_dlp_json(args):
-    proc = subprocess.run(
-        [sys.executable, "-m", "yt_dlp", *args],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        print(f"  [warn] yt-dlp 실패: {' '.join(args)}\n{proc.stderr.strip()[-500:]}", file=sys.stderr)
+    for attempt, delay in enumerate((0, *BOT_CHECK_RETRY_DELAYS)):
+        if delay:
+            time.sleep(delay)
+        proc = subprocess.run(
+            [sys.executable, "-m", "yt_dlp", *args],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            break
+        is_bot_check = "not a bot" in proc.stderr
+        if not is_bot_check or attempt == len(BOT_CHECK_RETRY_DELAYS):
+            print(f"  [warn] yt-dlp 실패: {' '.join(args)}\n{proc.stderr.strip()[-500:]}", file=sys.stderr)
+            break
+        print(f"  [retry] 봇 차단 감지, {BOT_CHECK_RETRY_DELAYS[attempt]}초 후 재시도: {args[-1]}", file=sys.stderr)
     videos = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -62,8 +74,13 @@ def run_yt_dlp_json(args):
     return videos
 
 
+TAB_SUFFIXES = ("/videos", "/streams", "/shorts")
+
+
 def list_recent_videos(channel_url, max_videos=15):
-    url = channel_url.rstrip("/") + "/videos"
+    url = channel_url.rstrip("/")
+    if not url.endswith(TAB_SUFFIXES):
+        url += "/videos"
     return run_yt_dlp_json(
         ["--flat-playlist", "--dump-json", "--playlist-end", str(max_videos), url]
     )
