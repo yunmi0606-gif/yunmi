@@ -1,6 +1,4 @@
-# 채널 목록 (channel list)
-# NOTE: 이 저장소(repo)에는 원본 channel.txt가 없어, 노션에 이미 저장된
-# 지난 기록(26.08.09~26.08.13)에서 공통적으로 확인된 채널 하나만 우선 등록했습니다.
-# 실제 사용하시는 전체 채널 목록(로컬 "주식시황1" 폴더의 channel.txt)과 다를 수 있으니
-# 확인 후 채널을 추가/수정해 주세요.
 https://www.youtube.com/@3protv
+https://www.youtube.com/@sidongtv/streams
+https://www.youtube.com/@duhwanpark534
+https://www.youtube.com/@MickeyPedia
