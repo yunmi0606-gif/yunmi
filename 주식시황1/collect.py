@@ -10,12 +10,21 @@ data/YYYY-MM-DD.json 으로 저장한다. (yt-dlp 필요: pip install yt-dlp)
     피하려면 --extractor-args "youtube:player_client=android" 조합을 쓴다.
     web 클라이언트는 거의 항상 429/PO Token 요구로 막히지만, android
     플레이어 API는 클라우드 IP에서도 안정적으로 메타데이터와 자동자막
-    (auto captions)을 내려받을 수 있었다(2026-09-09 확인). 그래도 유튜브
-    쪽 정책 변경으로 다시 막힐 수 있으니, 실패 시 --cookies-from-browser로
-    로그인 쿠키를 넘기거나 로컬(개인 PC) 환경에서 실행해야 한다.
+    (auto captions)을 내려받을 수 있었다(2026-09-09 확인).
+
+    다만 2026-09-10에 확인된 바로는, 같은 IP로 짧은 시간에 요청을 몰아서
+    보내면(예: 같은 날 전체 수집을 두 번 연달아 실행) android 클라이언트도
+    광범위하게 차단당할 수 있다. 이를 줄이기 위해 요청 사이에 PACE_DELAY
+    만큼 쉬어가고(사람이 훑어보는 것처럼), 하루 범위(since_days)를 벗어난
+    영상을 만나면 해당 채널은 더 볼 것 없다고 보고 바로 다음 채널로
+    넘어간다(업로드 목록이 최신순이라는 전제). 그래도 막히면
+    --cookies-from-browser로 로그인 쿠키를 넘기거나 로컬(개인 PC)
+    환경에서 실행해야 한다. 같은 날 이 스크립트를 반복 실행하지 않는 것도
+    차단을 피하는 데 도움이 된다.
 """
 import argparse
 import json
+import random
 import re
 import subprocess
 import sys
@@ -32,6 +41,14 @@ KST = timezone(timedelta(hours=9))
 PLAYER_CLIENT = "android"
 EXTRACTOR_ARGS = ["--extractor-args", f"youtube:player_client={PLAYER_CLIENT}"]
 
+# 요청 사이 기본 간격(초). 매 yt-dlp 호출 전에 이만큼(+지터) 쉬어서 봇 차단
+# 트리거가 되는 짧은 시간 내 요청 폭주를 피한다.
+PACE_DELAY = (2.0, 4.0)
+
+
+def pace():
+    time.sleep(random.uniform(*PACE_DELAY))
+
 
 def read_channels():
     channels = []
@@ -43,10 +60,11 @@ def read_channels():
     return channels
 
 
-BOT_CHECK_RETRY_DELAYS = (5, 15)  # 초 단위, "Sign in to confirm you're not a bot" 대응
+BOT_CHECK_RETRY_DELAYS = (10, 30, 60)  # 초 단위, "Sign in to confirm you're not a bot" 대응
 
 
 def run_yt_dlp_json(args):
+    pace()
     for attempt, delay in enumerate((0, *BOT_CHECK_RETRY_DELAYS)):
         if delay:
             time.sleep(delay)
@@ -146,27 +164,43 @@ def fetch_transcript(video_id, video_url, tmp_dir: Path):
     return text or None
 
 
+# 한 채널에서 연속으로 이만큼 상세 정보 수집에 완전히 실패하면(재시도까지
+# 다 써도 실패) 그 채널은 오늘 차단된 것으로 보고 남은 영상은 건너뛴다.
+# 끝까지 밀어붙여봐야 시간만 잡아먹고 성공 확률은 낮기 때문.
+CHANNEL_FAILURE_LIMIT = 2
+
+
 def collect(since_days=1, max_videos_per_channel=15, with_transcript=True):
     channels = read_channels()
     cutoff = datetime.now(KST) - timedelta(days=since_days)
     results = []
+    failed_channels = []
     tmp_dir = DATA_DIR / "subs_tmp"
 
     for channel_url in channels:
         print(f"[channel] {channel_url}")
         recent = list_recent_videos(channel_url, max_videos_per_channel)
+        consecutive_failures = 0
         for entry in recent:
             video_url = entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}"
             detail = fetch_video_detail(video_url)
             if not detail:
                 print(f"  [skip] 상세 정보 수집 실패: {video_url}")
+                consecutive_failures += 1
+                if consecutive_failures >= CHANNEL_FAILURE_LIMIT:
+                    print(f"  [skip-channel] 연속 {consecutive_failures}건 실패, 이 채널은 오늘 차단된 것으로 보고 건너뜁니다: {channel_url}")
+                    failed_channels.append(channel_url)
+                    break
                 continue
+            consecutive_failures = 0
 
             upload_date = detail.get("upload_date")  # YYYYMMDD
             if upload_date:
                 uploaded_at = datetime.strptime(upload_date, "%Y%m%d").replace(tzinfo=KST)
                 if uploaded_at < cutoff:
-                    continue
+                    # 업로드 목록은 최신순이므로, 하루 범위를 벗어난 영상을
+                    # 만나면 이후 영상도 전부 더 오래된 것 -> 채널 순회 종료.
+                    break
 
             transcript = None
             if with_transcript:
@@ -192,6 +226,10 @@ def collect(since_days=1, max_videos_per_channel=15, with_transcript=True):
     out_path = DATA_DIR / f"{datetime.now(KST).strftime('%Y-%m-%d')}.json"
     out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n총 {len(results)}개 영상 수집 완료 -> {out_path}")
+    if failed_channels:
+        print(f"[경고] 아래 채널은 오늘 봇 차단으로 수집하지 못했습니다 (내일 재시도 필요):")
+        for ch in failed_channels:
+            print(f"  - {ch}")
     return results
 
 
